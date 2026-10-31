@@ -25,7 +25,7 @@ Sources: [WebXR compatibility](https://developer.mozilla.org/en-US/docs/Web/API/
 
 ## Vercel
 
-The committed `vercel.json` selects Next.js, `npm ci` and `npm run build`. Node 24.x is specified in `package.json`. Import the repository with this project as its root directory. In **Settings -> Build and Deployment**, select the **Next.js** framework preset and leave the **Output Directory override disabled**. If an existing project has that override set to `out`, turn it off before redeploying.
+The committed `vercel.json` selects Next.js, `npm ci`, `npm run build` and an explicit Vercel output directory of `.next`. This repository setting overrides a saved dashboard output directory such as `out`; simply removing the repository property would allow that old dashboard value to apply again. Node 24.x is specified in `package.json`. Import the repository with this project as its root directory. In **Settings -> Build and Deployment**, select the **Next.js** framework preset. Set the dashboard Node.js version to **24.x** to match the repository and remove the version-mismatch warning. The repository output setting takes precedence, so no dashboard output change is required for this fix.
 
 Keep `output: "export"` in `next.config.ts`. Vercel's Next.js adapter first reads build manifests from `.next/`, then detects the static export and serves `out/` automatically. Setting Vercel's output directory to `out` makes it search for `out/routes-manifest.json` and fail with `NEXT_NO_ROUTES_MANIFEST`, even when the app build succeeds. Other plain static hosts can serve `out/` directly.
 
