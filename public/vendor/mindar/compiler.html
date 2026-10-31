@@ -1,0 +1,27 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Local image target compiler</title><style>html,body{margin:0;background:transparent}body{padding:6px 0}progress{width:100%;height:8px;accent-color:#64734e;display:block}</style></head><body><progress id="progress" max="100" value="0" aria-label="Compiling image target"></progress><script type="module">
+import { Compiler } from './mindar-image.prod.js';
+let token = null;
+const send = (data, transfer = []) => parent.postMessage({ source: 'atlasar-target-compiler', token, ...data }, location.origin, transfer);
+addEventListener('error', event => send({ type: 'error', message: event.message || 'Image compilation failed.' }));
+addEventListener('unhandledrejection', event => send({ type: 'error', message: event.reason?.message || 'Image compilation failed. Try a smaller image.' }));
+addEventListener('message', async event => {
+  if (event.source !== parent || event.origin !== location.origin || event.data?.type !== 'compile' || token !== null) return;
+  token = event.data.token;
+  let url;
+  try {
+    const file = new Blob([event.data.bytes], { type: event.data.mime });
+    url = URL.createObjectURL(file);
+    const image = new Image(); image.src = url; await image.decode();
+    if (Math.min(image.width, image.height) < 256 || Math.max(image.width, image.height) > 2048) throw new Error('Choose an image with each side from 256 to 2048 pixels.');
+    const compiler = new Compiler();
+    await compiler.compileImageTargets([image], progress => { document.getElementById('progress').value = progress; send({ type: 'progress', progress }); });
+    const features = compiler.data?.[0]?.matchingData?.reduce((count, keyframe) => count + keyframe.maximaPoints.length + keyframe.minimaPoints.length, 0) || 0;
+    if (features < 40) throw new Error('This image has too few distinctive features. Choose a detailed photograph or textured, asymmetric artwork.');
+    const data = compiler.exportData();
+    const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    send({ type: 'complete', bytes: buffer, features }, [buffer]);
+  } catch(error) { send({ type: 'error', message: error?.message || 'The image could not be compiled.' }); }
+  finally { if(url) URL.revokeObjectURL(url); }
+});
+send({ type: 'ready' });
+</script></body></html>
