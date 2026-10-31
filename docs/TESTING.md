@@ -6,7 +6,7 @@ Verified 31 October 2026. The local MVP is implemented. Automated browser eviden
 
 | Check | Result | Evidence / scope |
 |---|---|---|
-| Data/schema/assets/publication tests | **10 passed** | `npm test`, Node test runner |
+| Data/schema/assets/publication and surface policy tests | **21 passed** | `npm test`, Node test runner; includes stability, jitter, invalid hits, tracking gaps and slow frame rates |
 | TypeScript | **Passed** | `npm run typecheck` |
 | ESLint | **Passed** | `npm run lint`; generated output and retained upstream vendors excluded |
 | Production static build | **Passed** | `npm run build`; workspace/editor/experience/icon exported into `out/`, no build warnings |
@@ -18,6 +18,7 @@ Verified 31 October 2026. The local MVP is implemented. Automated browser eviden
 | Editor target-compiler workflow | **3 passed, no page errors** | `npm run test:compiler`; actual iframe compilation in 17 seconds, matching Blob pair, save/reload; `.artifacts/browser-compiler-results.json` |
 | Photo verification -> live placement | **7 passed, no page errors/uploads** | Real target matching gates a live stream; blank/invalid rejection, controls, portrait/square, stream cleanup and denied camera; `.artifacts/browser-photo-results.json` |
 | WebXR request/fallback integration | **4 passed, no page errors** | Actual photo matching/camera; injected XR request refusal verifies trusted-click arguments, stream exclusivity and recovery; `.artifacts/browser-placement-results.json` |
+| Synthetic WebXR surface policy/lifecycle | **13 passed, no page errors** | `npm run test:surface`; explicitly synthetic XR session/hits/anchor poses; `.artifacts/browser-surface-results.json`; does not establish physical tracking quality |
 | Physical iOS/Android camera and print recognition | **Not performed** | No connected physical test device |
 | Real mobile FPS, memory and thermals | **Not performed** | Desktop emulation cannot establish these |
 
@@ -71,4 +72,6 @@ Physical-device release acceptance remains open. Automated synthetic tracking es
 
 Photo input now verifies the configured target and opens the live camera only after a genuine match. It does not display the model over the selected image. Tests count and delegate native getUserMedia: blank/invalid photos make zero requests, each valid photo makes one, and exit ends every track. Portrait and square target photos activate new streams. The selected photo is not uploaded and its pose/canvas is discarded before live placement starts.
 
-Manual preview is clearly screen-relative. WebXR placement code uses real browser hit testing, a reticle and a local reference space. Its automated integration test injects only an available XR system whose requestSession always rejects: it verifies immersive-ar, required hit-test/dom-overlay, a connected UI-only overlay, active user gesture, ended manual tracks before requesting, and a new manual stream after refusal. **No successful XR session, hit-test result, world pose or physical surface tracking was fabricated or verified.** Actual native surface placement remains a physical-device acceptance gate.
+Manual preview is clearly screen-relative. WebXR placement code uses native plane hit testing, a stabilized reticle, optional anchors and a local reference space. `test:placement` injects only an available XR system whose requestSession always rejects: it verifies immersive-ar, required hit-test/dom-overlay, a connected UI-only overlay, active user gesture, ended manual tracks before requesting, and a new manual stream after refusal.
+
+The separate `test:surface` harness supplies an explicitly **synthetic** successful XR session, frames, hit results and anchor poses to the real application/Three renderer. It verifies rejection of invalid, tilted, distant and emulated poses; stability before automatic placement; jump rejection; 10 fps acquisition; tap confirmation with fresh-hit validation; viewer/anchor tracking loss; anchored and unanchored reference resets; anchor refusal; late-anchor deletion after reposition/exit; and session/source/camera cleanup. It also captures portrait and short-landscape controls. The fixture checks that anchor creation occurs during its active synthetic frame. These results verify policy and lifecycle, not a real detector or tracking accuracy. Actual native surface placement remains a physical-device acceptance gate. See [research, tuning and device steps](SURFACE_PLACEMENT.md).

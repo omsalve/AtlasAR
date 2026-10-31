@@ -5,10 +5,11 @@ import * as THREE from "three";
 import { ArrowLeft, ArrowRight, Camera, Check, Layers3, LoaderCircle, Minus, Move, Plus, RotateCcw, RotateCw, ScanLine } from "lucide-react";
 import type { Project } from "@/lib/project";
 import { applyFloorVisibility, disposeObject, loadModel } from "@/lib/scene";
+import { SurfaceTracker, type SurfaceState } from "@/lib/surface-placement";
 import "./free-placement.css";
 
 type Mode = "loading" | "manual" | "requesting-xr" | "xr-search" | "xr-placed" | "denied" | "unsupported" | "error";
-type Status = { mode: Mode; message: string; surfaceReady: boolean; canRetry: boolean };
+type Status = { mode: Mode; message: string; surfaceReady: boolean; canRetry: boolean; surfaceProgress?: number; tracking?: "searching" | "tracking" | "lost" };
 type Props = { project: Project; onExit: () => void; onScanTarget: () => void; onInterior?: () => void };
 type Runtime = {
   start: () => void;
@@ -17,6 +18,7 @@ type Runtime = {
   startXR: () => void;
   useManual: () => void;
   place: () => void;
+  setAutoPlace: (enabled: boolean) => void;
   reposition: () => void;
   rotate: (angle: number) => void;
   scale: (multiplier: number) => void;
@@ -63,6 +65,10 @@ function createRuntime(host: HTMLDivElement, overlay: HTMLDivElement, project: P
   let xrSession: XRSession | undefined;
   let hitSource: XRHitTestSource | undefined;
   let referenceSpace: XRReferenceSpace | undefined;
+  let anchor: XRAnchor | undefined;
+  let anchorEpoch = 0, xrEpoch = 0, placementRequested = false, autoPlace = true;
+  const anchorOffset = new THREE.Matrix4();
+  const surfaces = new SurfaceTracker();
   let placed = false, trackingLost = false, manualNotice = "";
   let userScale = 1, yaw = 0, screenX = .5, screenY = .48;
   const center = new THREE.Vector3(0, 3, 0);
@@ -135,73 +141,164 @@ function createRuntime(host: HTMLDivElement, overlay: HTMLDivElement, project: P
     }
   }
 
-  function cancelHitSource() { try { hitSource?.cancel(); } catch { /* Ending an XR session may already invalidate its source. */ } hitSource = undefined; referenceSpace = undefined; }
+  function clearAnchor() {
+    anchorEpoch += 1;
+    try { anchor?.delete(); } catch { /* A finished session may already have released the anchor. */ }
+    anchor = undefined;
+  }
+  function resetSearch(message = "") {
+    clearAnchor(); surfaces.reset(); placementRequested = false; placed = false;
+    placement.visible = false; reticle.visible = false;
+    publish({ mode: "xr-search", surfaceReady: false, surfaceProgress: 0, tracking: "searching", message });
+  }
+  const spaceReset = () => {
+    surfaces.reset(); reticle.visible = false; placement.visible = false; placementRequested = false;
+    if (!anchor) resetSearch("Tracking changed. Scan the floor or tabletop again to place the building safely.");
+    else { trackingLost = true; publish({ surfaceReady: false, tracking: "lost", message: "Tracking paused. Hold your phone steady while the building’s anchor recovers." }); }
+  };
+  const visibilityChanged = () => {
+    if (xrSession?.visibilityState !== "visible") {
+      surfaces.reset(); placementRequested = false; placement.visible = false; reticle.visible = false; trackingLost = true;
+      publish({ tracking: "lost", surfaceReady: false, surfaceProgress: 0, message: "Tracking paused. Return to the camera view and move slowly to recover." });
+    }
+  };
+  function cancelHitSource() {
+    clearAnchor(); surfaces.reset(); placementRequested = false;
+    try { hitSource?.cancel(); } catch { /* Ending an XR session may already invalidate its source. */ }
+    referenceSpace?.removeEventListener("reset", spaceReset);
+    hitSource = undefined; referenceSpace = undefined;
+  }
   function restoreManual(message = "") {
     if (disposed) return;
+    xrEpoch += 1;
     xrSession = undefined; renderer.xr.enabled = false; reticle.visible = false; placement.visible = false; placed = false; trackingLost = false; manualNotice = message;
     placement.matrixAutoUpdate = true; placement.matrix.identity(); placement.position.set(0, 0, 0); placement.quaternion.identity(); placement.scale.setScalar(1);
-    publish({ mode: "loading", surfaceReady: false, message });
+    publish({ mode: "loading", surfaceReady: false, surfaceProgress: 0, tracking: "searching", message });
     updateTransform(); fitManualCamera(); void startCamera();
   }
-  const ended = () => { cancelHitSource(); if (!disposed) restoreManual("Surface placement ended. You’re back in the manual camera preview."); };
+  const ended = () => {
+    xrEpoch += 1;
+    xrSession?.removeEventListener("end", ended); xrSession?.removeEventListener("select", place); xrSession?.removeEventListener("visibilitychange", visibilityChanged);
+    cancelHitSource(); if (!disposed) restoreManual("Surface placement ended. You’re back in the manual camera preview.");
+  };
   function place() {
-    if (!xrSession || placed || !reticle.visible || !status.surfaceReady) return;
+    if (!xrSession || placed || !status.surfaceReady) return;
+    // A DOM click does not own an active XRFrame. Validate and use a fresh hit next frame.
+    placementRequested = true;
+  }
+  function placeInFrame(hit: XRHitTestResult, hitMatrix: ArrayLike<number>) {
+    if (!xrSession || placed) return;
+    placementRequested = false;
     placement.matrix.copy(reticle.matrix); placement.matrixAutoUpdate = false; placement.visible = true;
-    placed = true; reticle.visible = false; publish({ mode: "xr-placed", surfaceReady: false, message: "" });
+    placed = true; reticle.visible = false;
+    publish({ mode: "xr-placed", surfaceReady: false, surfaceProgress: 1, tracking: "tracking", message: "Building placed. Walk slowly to look around it." });
+    const session = xrSession, epoch = ++anchorEpoch;
+    if (!hit.createAnchor || (session.enabledFeatures && !session.enabledFeatures.includes("anchors"))) return;
+    // Keep the averaged, upright placement relative to the native hit anchor.
+    anchorOffset.copy(new THREE.Matrix4().fromArray(hitMatrix).invert()).multiply(placement.matrix);
+    try {
+      // Must be invoked synchronously while this hit's XRFrame is active.
+      void hit.createAnchor().then(next => {
+        if (disposed || xrSession !== session || epoch !== anchorEpoch || !placed) { next.delete(); return; }
+        anchor = next;
+      }).catch(() => {
+        if (!disposed && xrSession === session && epoch === anchorEpoch) publish({ message: "Building placed using world tracking. If it shifts, choose Reposition and scan a textured surface." });
+      });
+    } catch { /* Anchors are optional; the native world-space placement remains usable. */ }
   }
   function startXR() {
     if (disposed || !modelReady || xrSession || !navigator.xr || status.mode === "requesting-xr") return;
     // requestSession must be called directly in the click's activation, before awaits.
     stopCamera(); placement.visible = false;
     publish({ mode: "requesting-xr", message: "Starting surface placement…", surfaceReady: false });
+    const attempt = ++xrEpoch;
+    let ownedSession: XRSession | undefined;
     let request: Promise<XRSession>;
-    try { request = navigator.xr.requestSession("immersive-ar", { requiredFeatures: ["hit-test", "dom-overlay"], domOverlay: { root: overlay } }); }
+    try { request = navigator.xr.requestSession("immersive-ar", { requiredFeatures: ["hit-test", "dom-overlay"], optionalFeatures: ["anchors"], domOverlay: { root: overlay } }); }
     catch (error) { restoreManual(error instanceof Error ? error.message : "Surface placement could not start. You can use manual placement."); return; }
     void request.then(async session => {
-      if (disposed) { await session.end(); return; }
-      xrSession = session; session.addEventListener("end", ended); session.addEventListener("select", place);
+      ownedSession = session;
+      if (disposed || attempt !== xrEpoch) { await session.end(); return; }
+      xrSession = session; session.addEventListener("end", ended); session.addEventListener("select", place); session.addEventListener("visibilitychange", visibilityChanged);
       camera.position.set(0, 0, 0); camera.quaternion.identity(); camera.updateMatrixWorld();
       renderer.xr.enabled = true; renderer.xr.setReferenceSpaceType("local");
       await renderer.xr.setSession(session);
-      if (disposed || xrSession !== session) { await session.end(); return; }
-      referenceSpace = renderer.xr.getReferenceSpace() || await session.requestReferenceSpace("local");
+      if (disposed || attempt !== xrEpoch || xrSession !== session) { await session.end(); return; }
+      const local = renderer.xr.getReferenceSpace() || await session.requestReferenceSpace("local");
+      if (disposed || attempt !== xrEpoch || xrSession !== session) { await session.end(); return; }
+      referenceSpace = local;
       renderer.xr.setReferenceSpace(referenceSpace);
+      referenceSpace.addEventListener("reset", spaceReset);
       const viewer = await session.requestReferenceSpace("viewer");
+      if (disposed || attempt !== xrEpoch || xrSession !== session) { await session.end(); return; }
       if (!session.requestHitTestSource) throw new Error("This browser does not provide surface hit testing.");
       const source = await session.requestHitTestSource({ space: viewer, entityTypes: ["plane"] });
       if (!source) throw new Error("Surface hit testing could not start.");
-      if (disposed || xrSession !== session) { source.cancel(); await session.end(); return; }
-      hitSource = source; placed = false; updateTransform();
-      publish({ mode: "xr-search", surfaceReady: false, message: "" });
+      if (disposed || attempt !== xrEpoch || xrSession !== session) { source.cancel(); await session.end(); return; }
+      hitSource = source; trackingLost = false; resetSearch(); updateTransform();
     }).catch(async error => {
-      const failed = xrSession;
+      const failed = ownedSession;
+      if (failed) { failed.removeEventListener("end", ended); failed.removeEventListener("select", place); failed.removeEventListener("visibilitychange", visibilityChanged); }
+      if (disposed || attempt !== xrEpoch) { await failed?.end().catch(() => {}); return; }
       cancelHitSource(); xrSession = undefined;
-      if (failed) { failed.removeEventListener("end", ended); failed.removeEventListener("select", place); await failed.end().catch(() => {}); }
-      if (!disposed) restoreManual(`Surface placement is unavailable: ${error instanceof Error ? error.message : "the browser could not start this mode"}. Manual preview is available instead.`);
+      await failed?.end().catch(() => {});
+      if (!disposed && attempt === xrEpoch) restoreManual(`Surface placement is unavailable: ${error instanceof Error ? error.message : "the browser could not start this mode"}. Manual preview is available instead.`);
     });
   }
   function useManual() {
     if (!xrSession) return;
     publish({ mode: "loading", message: "Returning to the live camera…" });
-    void xrSession.end().catch(() => { cancelHitSource(); restoreManual("The XR session ended. Manual camera preview is available."); });
+    const session = xrSession;
+    void session.end().catch(() => { if (xrSession === session) { cancelHitSource(); restoreManual("The XR session ended. Manual camera preview is available."); } });
   }
   const suppressXRUi = (event: Event) => { if (event.target instanceof Element && event.target.closest("[data-placement-ui]")) event.preventDefault(); };
   overlay.addEventListener("beforexrselect", suppressXRUi);
 
-  renderer.setAnimationLoop((_time, frame) => {
+  function searchMessage(surface: SurfaceState, elapsed: number) {
+    if (surface.reason === "tilted") return "Aim down at a level floor or tabletop. Walls and steep surfaces cannot support the building.";
+    if (surface.reason === "distance") return "Move closer to the surface, keeping it at least 25 cm from the camera.";
+    if (surface.reason === "unstable") return "The surface estimate moved. Hold still briefly while it settles.";
+    if (surface.phase === "stabilizing") return "Surface detected. Hold your phone steady for a moment…";
+    if (surface.phase === "ready") return autoPlace ? "Surface is stable. Placing the building…" : "Surface is stable. Tap Place building to confirm.";
+    return elapsed > 10_000 ? "Try a brighter, textured floor or tabletop. Avoid mirrors, glass and plain surfaces; move slowly side to side." : "Move slowly side to side and aim at a well-lit floor or tabletop.";
+  }
+  let searchStarted = 0;
+
+  renderer.setAnimationLoop((time, frame) => {
     if (disposed) return;
     if (frame && xrSession && referenceSpace && hitSource) {
       const viewer = frame.getViewerPose(referenceSpace);
-      if (!viewer) {
+      if (!viewer || viewer.emulatedPosition || (xrSession.visibilityState && xrSession.visibilityState !== "visible")) {
         placement.visible = false; reticle.visible = false;
-        if (!trackingLost) { trackingLost = true; publish({ message: "Tracking paused. Move your phone slowly to recover the surface.", surfaceReady: false }); }
+        surfaces.reset(); placementRequested = false;
+        if (!trackingLost) { trackingLost = true; publish({ tracking: "lost", message: "Tracking paused. Move your phone slowly to recover the surface.", surfaceReady: false, surfaceProgress: 0 }); }
       } else {
-        if (trackingLost) { trackingLost = false; placement.visible = placed; publish({ message: "" }); }
-        if (!placed) {
-          const poses = frame.getHitTestResults(hitSource).map(hit => hit.getPose(referenceSpace!)).filter((pose): pose is XRPose => !!pose && pose.transform.matrix[5] > .75);
-          reticle.visible = poses.length > 0;
-          if (poses[0]) reticle.matrix.fromArray(poses[0].transform.matrix);
-          if (status.surfaceReady !== reticle.visible) publish({ surfaceReady: reticle.visible });
+        if (placed) {
+          const anchorPose = anchor ? frame.getPose(anchor.anchorSpace, referenceSpace) : null;
+          const pose = anchorPose && !anchorPose.emulatedPosition ? anchorPose : null;
+          placement.visible = !anchor || !!pose;
+          if (pose) placement.matrix.fromArray(pose.transform.matrix).multiply(anchorOffset);
+          if (!placement.visible) {
+            if (!trackingLost) { trackingLost = true; publish({ tracking: "lost", message: "Anchor tracking paused. Point back toward the building’s surface to recover it." }); }
+          } else if (trackingLost) { trackingLost = false; publish({ tracking: "tracking", message: "Tracking recovered. The building is back on its surface." }); }
+        } else {
+          if (!searchStarted) searchStarted = time;
+          trackingLost = false;
+          const hits = frame.getHitTestResults(hitSource);
+          const matrices = hits.map(hit => { const pose = hit.getPose(referenceSpace!); return pose && !pose.emulatedPosition ? pose.transform.matrix : null; });
+          const surface = surfaces.update(matrices, viewer.transform.matrix, time);
+          reticle.visible = !!surface.position;
+          if (surface.position) {
+            const position = new THREE.Vector3(...surface.position);
+            const heading = Math.atan2(viewer.transform.position.x - position.x, viewer.transform.position.z - position.z);
+            reticle.matrix.makeRotationY(heading).setPosition(position);
+            (reticle.material as THREE.MeshBasicMaterial).color.setHex(surface.phase === "ready" ? 0xd8e7b3 : 0xe8b356);
+          }
+          const message = searchMessage(surface, time - searchStarted);
+          const progress = Math.floor(surface.progress * 10) / 10;
+          if (status.surfaceReady !== (surface.phase === "ready") || status.surfaceProgress !== progress || status.message !== message || status.tracking !== "searching") publish({ surfaceReady: surface.phase === "ready", surfaceProgress: progress, message, tracking: "searching" });
+          if (surface.phase === "ready" && (autoPlace || placementRequested)) { placeInFrame(hits[surface.hitIndex], matrices[surface.hitIndex]!); searchStarted = 0; }
+          else if (surface.phase !== "ready") placementRequested = false;
         }
       }
     }
@@ -232,13 +329,13 @@ function createRuntime(host: HTMLDivElement, overlay: HTMLDivElement, project: P
   host.addEventListener("pointerdown", down); host.addEventListener("pointermove", move); host.addEventListener("pointerup", up); host.addEventListener("pointercancel", cancel); host.addEventListener("wheel", wheel, { passive: false });
 
   function release() {
-    if (disposed) return; disposed = true;
+    if (disposed) return; disposed = true; xrEpoch += 1;
     stopCamera(); observer.disconnect(); renderer.setAnimationLoop(null); cancelHitSource();
     overlay.removeEventListener("beforexrselect", suppressXRUi);
     host.removeEventListener("pointerdown", down); host.removeEventListener("pointermove", move); host.removeEventListener("pointerup", up); host.removeEventListener("pointercancel", cancel); host.removeEventListener("wheel", wheel);
     const session = xrSession; xrSession = undefined;
     const dispose = () => { renderer.xr.dispose(); renderer.dispose(); renderer.forceContextLoss(); renderer.domElement.remove(); };
-    if (session) { session.removeEventListener("end", ended); session.removeEventListener("select", place); void session.end().catch(() => {}).finally(dispose); } else dispose();
+    if (session) { session.removeEventListener("end", ended); session.removeEventListener("select", place); session.removeEventListener("visibilitychange", visibilityChanged); void session.end().catch(() => {}).finally(dispose); } else dispose();
     if (model) disposeObject(model);
     reticle.geometry.dispose(); (reticle.material as THREE.Material).dispose(); focus.geometry.dispose(); (focus.material as THREE.Material).dispose();
   }
@@ -252,9 +349,10 @@ function createRuntime(host: HTMLDivElement, overlay: HTMLDivElement, project: P
       }).catch(error => { if (!disposed) { fatal = true; stopCamera(); placement.visible = false; publish({ mode: "error", message: error instanceof Error ? error.message : "The building could not be loaded.", canRetry: false }); } });
     },
     release, startCamera, startXR, useManual, place,
-    reposition: () => { if (xrSession) { placed = false; placement.visible = false; publish({ mode: "xr-search", surfaceReady: false, message: "" }); } },
+    setAutoPlace: enabled => { autoPlace = enabled; placementRequested = false; },
+    reposition: () => { if (xrSession) { searchStarted = 0; resetSearch(); } },
     rotate: angle => { yaw += angle; updateTransform(); }, scale,
-    reset: () => { userScale = 1; yaw = 0; screenX = .5; screenY = .48; updateTransform(); },
+    reset: () => { userScale = 1; yaw = 0; screenX = .5; screenY = .48; if (xrSession) { searchStarted = 0; resetSearch(); } updateTransform(); },
     floor: id => { if (model) applyFloorVisibility(model, project.floors, id); },
     poi: id => { const item = project.pois.find(p => p.id === id); focus.visible = !!item; if (item) focus.position.fromArray(item.position); },
   };
@@ -264,6 +362,7 @@ export default function FreePlacement({ project, onExit, onScanTarget, onInterio
   const host = useRef<HTMLDivElement>(null), overlay = useRef<HTMLDivElement>(null), runtime = useRef<Runtime | null>(null);
   const [status, setStatus] = useState<Status>({ mode: "loading", message: "Opening the live camera and preparing the building…", surfaceReady: false, canRetry: false });
   const [supportsXR, setSupportsXR] = useState(false);
+  const [autoPlace, setAutoPlace] = useState(true);
   const [floor, setFloor] = useState("");
   const [selected, setSelected] = useState("");
   useEffect(() => {
@@ -282,22 +381,24 @@ export default function FreePlacement({ project, onExit, onScanTarget, onInterio
   const poi = project.pois.find(item => item.id === selected);
   function leave(callback: () => void) { runtime.current?.release(); callback(); }
   function reset() { runtime.current?.reset(); runtime.current?.floor(""); runtime.current?.poi(""); setFloor(""); setSelected(""); }
-  const title = status.mode === "manual" ? "Manual camera preview" : status.mode === "xr-placed" ? "Placed on a real surface" : status.mode === "xr-search" ? status.surfaceReady ? "Surface found — ready to place" : "Looking for a floor or tabletop" : status.mode === "denied" ? "Camera permission needed" : status.mode === "unsupported" ? "Camera placement unavailable" : status.mode === "error" ? "Placement could not start" : status.mode === "requesting-xr" ? "Starting surface placement" : "Opening your live camera";
-  return <section className="free-placement" data-mode={status.mode} aria-label="Live camera building placement">
+  const title = native && status.tracking === "lost" ? "Tracking paused — move slowly" : status.mode === "manual" ? "Manual camera preview" : status.mode === "xr-placed" ? "Placed on a real surface" : status.mode === "xr-search" ? status.surfaceReady ? "Surface found — ready to place" : status.surfaceProgress ? "Surface detected — hold steady" : "Looking for a floor or tabletop" : status.mode === "denied" ? "Camera permission needed" : status.mode === "unsupported" ? "Camera placement unavailable" : status.mode === "error" ? "Placement could not start" : status.mode === "requesting-xr" ? "Starting surface placement" : "Opening your live camera";
+  return <section className="free-placement" data-mode={status.mode} data-tracking={status.tracking} aria-label="Live camera building placement">
     <div className="fp-camera-host" ref={host}/>
     <div className="fp-overlay" ref={overlay}>
       <header className="fp-header" data-placement-ui><button className="fp-button" onClick={() => leave(onExit)}><ArrowLeft size={16}/>Back to 3D</button><span>FREE PLACEMENT</span><button className="fp-button" onClick={() => leave(onScanTarget)}><ScanLine size={16}/>Scan physical target</button></header>
-      <div className="fp-status" role="status">{busy ? <LoaderCircle size={16} className="fp-spin"/> : native ? <Check size={16}/> : <Camera size={16}/>}<span>{title}</span></div>
-      {status.mode === "manual" && <div className="fp-mode-note">Screen-relative placement. This mode does not track surfaces or keep the building fixed as you move.</div>}
+      <div className="fp-status" role="status">{busy ? <LoaderCircle size={16} className="fp-spin"/> : native && status.tracking !== "lost" && status.mode === "xr-placed" ? <Check size={16}/> : native ? <ScanLine size={16}/> : <Camera size={16}/>}<span>{title}</span></div>
+      {status.mode === "manual" && <div className="fp-mode-note">Screen-relative placement. This mode does not track surfaces or keep the building fixed as you move.{!supportsXR && " Surface tracking is unavailable in this browser. Scan the physical target for image-anchored AR."}</div>}
+      {status.mode === "xr-search" && <div className="fp-scan-guide" aria-hidden="true"><span/><i/><span/></div>}
       {(busy || failure) && <div className="fp-state-panel" data-placement-ui><Camera size={30}/><h1>{title}</h1><p>{status.message}</p>{status.canRetry && <button className="fp-button fp-primary" onClick={() => { void runtime.current?.startCamera(); }}>Try camera again</button>}{failure && <button className="fp-button" onClick={() => leave(onExit)}>Explore without a camera<ArrowRight size={16}/></button>}</div>}
       {!busy && !failure && <div className="fp-bottom" data-placement-ui>
         {status.message && <p className="fp-message">{status.message}</p>}
         {status.mode === "manual" && supportsXR && <div className="fp-surface-offer"><div><strong>Place it in your room.</strong><span>Your browser offers surface tracking. Tap to start native AR.</span></div><button className="fp-button fp-primary" onClick={() => runtime.current?.startXR()}><Move size={16}/>Place on a surface</button></div>}
-        {native && <div className="fp-native-controls"><p>{status.mode === "xr-search" ? "Move slowly and aim at a well-lit floor or tabletop. A ring marks the detected surface." : "The building uses this AR session’s world coordinates. You can look around it."}</p>{status.mode === "xr-search" ? <button className="fp-button fp-primary" disabled={!status.surfaceReady} onClick={() => runtime.current?.place()}><Check size={16}/>Place building</button> : <button className="fp-button fp-primary" onClick={() => runtime.current?.reposition()}><Move size={16}/>Reposition</button>}<button className="fp-button" onClick={() => runtime.current?.useManual()}>Use manual preview</button></div>}
-        <p className="fp-gesture-help">{native ? "Use the controls to rotate or resize." : "Tap or drag to position · Pinch to resize"}</p>
+        {(native && status.mode === "xr-search" || status.mode === "manual" && supportsXR) && <label className="fp-auto-place"><input type="checkbox" checked={autoPlace} onChange={event => { setAutoPlace(event.target.checked); runtime.current?.setAutoPlace(event.target.checked); }}/>Auto-place on a stable surface</label>}
+        {native && <div className="fp-native-controls">{status.mode === "xr-search" && <div className="fp-surface-progress" role="progressbar" aria-label="Surface stability" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round((status.surfaceProgress || 0) * 100)}><span style={{ width: `${(status.surfaceProgress || 0) * 100}%` }}/></div>}<p>{status.mode === "xr-search" ? autoPlace ? "Aim the center of the screen at the surface. Hold steady and the building will appear automatically." : "Aim the center of the screen at the surface. Hold steady, then confirm placement." : "The building is placed in your room. Use Reposition to choose a different surface."}</p>{status.mode === "xr-search" ? <button className="fp-button fp-primary" disabled={!status.surfaceReady} onClick={() => runtime.current?.place()}><Check size={16}/>Place building</button> : <button className="fp-button fp-primary" onClick={() => runtime.current?.reposition()}><Move size={16}/>Reposition</button>}<button className="fp-button" onClick={() => runtime.current?.useManual()}>Use manual preview</button></div>}
+        {status.mode !== "xr-search" && <><p className="fp-gesture-help">{native ? "Use the controls to rotate or resize." : "Tap or drag to position · Pinch to resize"}</p>
         <div className="fp-tools"><button className="fp-button fp-icon" aria-label="Rotate left" onClick={() => runtime.current?.rotate(Math.PI / 12)}><RotateCcw size={18}/></button><button className="fp-button fp-icon" aria-label="Rotate right" onClick={() => runtime.current?.rotate(-Math.PI / 12)}><RotateCw size={18}/></button><button className="fp-button fp-icon" aria-label="Make building smaller" onClick={() => runtime.current?.scale(.85)}><Minus size={18}/></button><button className="fp-button fp-icon" aria-label="Make building larger" onClick={() => runtime.current?.scale(1.15)}><Plus size={18}/></button><button className="fp-button" onClick={reset}>Reset placement</button>{project.floors.length > 0 && <label className="fp-floor"><Layers3 size={16}/><select aria-label="Placement floor" value={floor} onChange={event => { setFloor(event.target.value); runtime.current?.floor(event.target.value); }}><option value="">All floors</option>{project.floors.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>
         {poi && <div className="fp-poi-details"><div><strong>{poi.name}</strong><p>{poi.description}</p></div>{poi.interior && project.interiorModel && onInterior && <button className="fp-button" onClick={() => leave(onInterior)}>Step inside<ArrowRight size={16}/></button>}</div>}
-        <div className="fp-pois" aria-label="Placement points of interest">{project.pois.map((item, index) => <button key={item.id} aria-pressed={selected === item.id} onClick={() => { const next = selected === item.id ? "" : item.id; setSelected(next); runtime.current?.poi(next); }}><span>{String(index + 1).padStart(2, "0")}</span>{item.name}</button>)}</div>
+        <div className="fp-pois" aria-label="Placement points of interest">{project.pois.map((item, index) => <button key={item.id} aria-pressed={selected === item.id} onClick={() => { const next = selected === item.id ? "" : item.id; setSelected(next); runtime.current?.poi(next); }}><span>{String(index + 1).padStart(2, "0")}</span>{item.name}</button>)}</div></>}
       </div>}
     </div>
   </section>;

@@ -18,7 +18,8 @@
     "test:compiler": "node scripts/browser-compiler.mjs",
     "vendor:mindar": "node scripts/vendor-mindar.mjs",
     "test:photo": "node scripts/browser-photo.mjs",
-    "test:placement": "node scripts/browser-placement.mjs"
+    "test:placement": "node scripts/browser-placement.mjs",
+    "test:surface": "node scripts/browser-surface.mjs"
   },
   "dependencies": {
     "fflate": "^0.8.3",
