@@ -25,7 +25,11 @@ Sources: [WebXR compatibility](https://developer.mozilla.org/en-US/docs/Web/API/
 
 ## Vercel
 
-The committed `vercel.json` selects Next.js, `npm ci`, `npm run build` and static output `out`. Node 24.x is specified in `package.json`. Import the repository with this project as its root directory and use the resulting HTTPS production URL on the phone. The app needs no database, API keys, paid AR SDK or backend functions. Bundled sample assets and local tracking/decoder files ship with the build.
+The committed `vercel.json` selects Next.js, `npm ci` and `npm run build`. Node 24.x is specified in `package.json`. Import the repository with this project as its root directory. In **Settings -> Build and Deployment**, select the **Next.js** framework preset and leave the **Output Directory override disabled**. If an existing project has that override set to `out`, turn it off before redeploying.
+
+Keep `output: "export"` in `next.config.ts`. Vercel's Next.js adapter first reads build manifests from `.next/`, then detects the static export and serves `out/` automatically. Setting Vercel's output directory to `out` makes it search for `out/routes-manifest.json` and fail with `NEXT_NO_ROUTES_MANIFEST`, even when the app build succeeds. Other plain static hosts can serve `out/` directly.
+
+After deploying the corrected commit, use the resulting HTTPS production URL on the phone. The app needs no database, API keys, paid AR SDK or backend functions. Bundled sample assets and local tracking/decoder files ship with the build.
 
 Vercel provides automatic HTTPS, satisfying the transport requirement for camera access and WebXR. HTTPS alone cannot add a browser's missing camera/XR capability or grant permission. Local production builds and browser checks pass; an actual Vercel deployment and physical phone session were not tested here.
 
